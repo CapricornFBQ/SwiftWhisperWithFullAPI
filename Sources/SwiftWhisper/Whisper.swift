@@ -44,7 +44,7 @@ public class Whisper {
 
         // swiftlint:disable line_length
         params.new_segment_callback = { (ctx: OpaquePointer?, _: OpaquePointer?, newSegmentCount: Int32, userData: UnsafeMutableRawPointer?) in
-        // swiftlint:enable line_length
+            // swiftlint:enable line_length
             guard let ctx = ctx,
                   let userData = userData else { return }
             let whisper = Unmanaged<Whisper>.fromOpaque(userData).takeUnretainedValue()
@@ -54,7 +54,8 @@ public class Whisper {
             var newSegments: [Segment] = []
             newSegments.reserveCapacity(Int(newSegmentCount))
 
-            let startIndex = segmentCount - newSegmentCount
+            // 防御：避免 newSegmentCount > segmentCount 导致负索引
+            let startIndex = max(0, segmentCount - newSegmentCount)
 
             for index in startIndex..<segmentCount {
                 guard let text = whisper_full_get_segment_text(ctx, index) else { continue }
@@ -68,8 +69,34 @@ public class Whisper {
                 ))
             }
 
+            // Optionally emit token-level callbacks per segment if enabled
+            // Emit token-level callbacks per segment regardless of timestamp computation (timestamps may be zero)
+            var tokenBatches: [(index: Int, tokens: [Token])] = []
+            for index in startIndex..<segmentCount {
+                let tokenCount = whisper_full_n_tokens(ctx, index)
+                if tokenCount <= 0 { continue }
+
+                var tokens: [Token] = []
+                tokens.reserveCapacity(Int(tokenCount))
+                // 防御：确保访问范围 0..<tokenCount
+                for t in 0..<tokenCount {
+                    let id = whisper_full_get_token_id(ctx, index, t)
+                    let tdata = whisper_full_get_token_data(ctx, index, t)
+                    // t0/t1 可能为 -1（特殊/空白 token），统一钳位到非负并保持单调
+                    let startMs = max(0, Int(tdata.t0) * 10)
+                    let endMs = max(startMs, Int(tdata.t1) * 10)
+                    let txtPtr = whisper_full_get_token_text(ctx, index, t)
+                    let text = txtPtr.map { String(Substring(cString: $0)) } ?? ""
+                    tokens.append(Token(id: id, text: text, startTimeMs: startMs, endTimeMs: endMs, p: tdata.p, pt: tdata.pt, ptsum: tdata.ptsum, vlen: tdata.vlen))
+                }
+                tokenBatches.append((index: Int(index), tokens: tokens))
+            }
+
             DispatchQueue.main.async {
                 delegate.whisper(whisper, didProcessNewSegments: newSegments, atIndex: Int(startIndex))
+                for batch in tokenBatches {
+                    delegate.whisper(whisper, didProcessNewTokens: batch.tokens, inSegmentAt: batch.index)
+                }
             }
         }
 
@@ -124,6 +151,23 @@ public class Whisper {
         frameCount = audioFrames.count
 
         DispatchQueue.global(qos: .userInitiated).async {
+            // 在进入 C 层前，设置一组更稳妥的参数组合：
+            // - 关闭 token_timestamps（实验性路径易触发 abort）
+            // - split_on_word = true 可避免极端边界空 token（即使 ts 关闭也可保留）
+            // - no_context = false：保留上下文，配合“滑窗”更稳（由上层控制输入上下文）
+            // - single_segment = true 与短窗/滑窗匹配
+            // - 禁用 speed_up 等可能改变内部时间轴的选项
+            self.params.tokenTimestamps = false
+            self.params.splitOnWord = true
+            self.params.noContext = false
+            self.params.singleSegment = true
+            self.params.printTimestamps = false
+            self.params.speedUp = false
+            // 我们的输入为 16k 采样率，推导时长（毫秒）
+            let durMs = Int32((Double(audioFrames.count) / 16000.0) * 1000.0)
+            self.params.offsetMs = 0
+            self.params.durationMs = durMs
+
             whisper_full(self.whisperContext, self.params.whisperParams, audioFrames, Int32(audioFrames.count))
 
             let segmentCount = whisper_full_n_segments(self.whisperContext)
