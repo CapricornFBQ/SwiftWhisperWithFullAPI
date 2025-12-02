@@ -151,22 +151,20 @@ public class Whisper {
         frameCount = audioFrames.count
 
         DispatchQueue.global(qos: .userInitiated).async {
-            // 在进入 C 层前，设置一组更稳妥的参数组合：
-            // - 关闭 token_timestamps（实验性路径易触发 abort）
-            // - split_on_word = true 可避免极端边界空 token（即使 ts 关闭也可保留）
-            // - no_context = false：保留上下文，配合“滑窗”更稳（由上层控制输入上下文）
-            // - single_segment = true 与短窗/滑窗匹配
-            // - 禁用 speed_up 等可能改变内部时间轴的选项
-            self.params.tokenTimestamps = false
-            self.params.splitOnWord = true
-            self.params.noContext = false
-            self.params.singleSegment = true
-            self.params.printTimestamps = false
-            self.params.speedUp = false
-            // 我们的输入为 16k 采样率，推导时长（毫秒）
+            // 只设置必须的计算型参数，其他参数完全由外部 WhisperAdapter 控制
+            // 避免内部强制覆盖导致与外部配置冲突
+
+            // 计算音频时长（毫秒）
             let durMs = Int32((Double(audioFrames.count) / 16000.0) * 1000.0)
             self.params.offsetMs = 0
             self.params.durationMs = durMs
+
+            // 强制禁用实验性/不稳定特性（安全措施）
+            self.params.tokenTimestamps = false  // 实验性，易触发 abort
+            self.params.speedUp = false          // 可能改变内部时间轴
+
+            // 注意：noContext, singleSegment, splitOnWord 等参数
+            // 由外部根据场景（快速上屏 vs 句子ASR）决定，此处不再强制设置
 
             whisper_full(self.whisperContext, self.params.whisperParams, audioFrames, Int32(audioFrames.count))
 
